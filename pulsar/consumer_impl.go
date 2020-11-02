@@ -57,6 +57,7 @@ const defaultNackRedeliveryDelay = 1 * time.Minute
 
 type acker interface {
 	AckID(id trackingMessageID)
+	AckCumulativeID(id trackingMessageID)
 	NackID(id trackingMessageID)
 }
 
@@ -424,6 +425,26 @@ func (c *consumer) AckID(msgID MessageID) {
 	}
 
 	c.consumers[mid.partitionIdx].AckID(mid)
+}
+
+// AckCumulative the consumption of all messages in the stream, including the one specified
+func (c *consumer) AckCumulative(msg Message) {
+	c.AckCumulativeID(msg.ID())
+}
+
+// AckCumulative the consumption of all messages in the stream, including the one specified by its MessageID
+func (c *consumer) AckCumulativeID(msgID MessageID) {
+	mid, ok := c.messageID(msgID)
+	if !ok {
+		return
+	}
+
+	if mid.consumer != nil {
+		mid.AckCumulative()
+		return
+	}
+
+	c.consumers[mid.partitionIdx].AckCumulativeID(mid)
 }
 
 // ReconsumeLater mark a message for redelivery after custom delay

@@ -136,6 +136,22 @@ func (c *multiTopicConsumer) AckID(msgID MessageID) {
 	mid.Ack()
 }
 
+// Ack the consumption of a single message, identified by its MessageID
+func (c *multiTopicConsumer) AckCumulativeID(msgID MessageID) {
+	mid, ok := toTrackingMessageID(msgID)
+	if !ok {
+		c.log.Warnf("invalid message id type %T", msgID)
+		return
+	}
+
+	if mid.consumer == nil {
+		c.log.Warnf("unable to ack messageID=%+v can not determine topic", msgID)
+		return
+	}
+
+	mid.AckCumulative()
+}
+
 func (c *multiTopicConsumer) ReconsumeLater(msg Message, delay time.Duration) {
 	consumer, ok := c.consumers[msg.Topic()]
 	if !ok {

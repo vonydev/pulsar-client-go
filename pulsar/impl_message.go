@@ -57,6 +57,15 @@ func (id trackingMessageID) Ack() {
 	}
 }
 
+func (id trackingMessageID) AckCumulative() {
+	if id.consumer == nil {
+		return
+	}
+	if id.ackCumulative() {
+		id.consumer.AckCumulativeID(id)
+	}
+}
+
 func (id trackingMessageID) Nack() {
 	if id.consumer == nil {
 		return
@@ -67,6 +76,13 @@ func (id trackingMessageID) Nack() {
 func (id trackingMessageID) ack() bool {
 	if id.tracker != nil && id.batchIdx > -1 {
 		return id.tracker.ack(int(id.batchIdx))
+	}
+	return true
+}
+
+func (id trackingMessageID) ackCumulative() bool {
+	if id.tracker != nil && id.batchIdx > -1 {
+		return id.tracker.ackCumulative(int(id.batchIdx))
 	}
 	return true
 }
@@ -257,6 +273,21 @@ func (t *ackTracker) ack(batchID int) bool {
 	t.Lock()
 	defer t.Unlock()
 	t.batchIDs = t.batchIDs.SetBit(t.batchIDs, batchID, 0)
+	return len(t.batchIDs.Bits()) == 0
+}
+
+func (t *ackTracker) ackCumulative(batchID int) bool {
+	if batchID < 0 {
+		return true
+	}
+	t.Lock()
+	defer t.Unlock()
+
+	// set all the bits up to and including batchID to 0
+	for i := 0; i <= batchID; i++ {
+		t.batchIDs = t.batchIDs.SetBit(t.batchIDs, i, 0)
+	}
+
 	return len(t.batchIDs.Bits()) == 0
 }
 

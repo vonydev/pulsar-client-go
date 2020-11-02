@@ -122,6 +122,7 @@ type partitionConsumerOpts struct {
 	interceptors               ConsumerInterceptors
 	maxReconnectToBroker       *uint
 	keySharedPolicy            *KeySharedPolicy
+	enableCumulativeAcks       bool
 	schema                     Schema
 }
 
@@ -161,6 +162,8 @@ type partitionConsumer struct {
 	nackTracker *negativeAcksTracker
 	dlq         *dlqRouter
 
+	cAckTracker *cumulativeAcksTracker
+
 	log log.Logger
 
 	compressionProviders map[pb.CompressionType]compression.Provider
@@ -196,6 +199,9 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 		"consumerID":   pc.consumerID,
 	})
 	pc.nackTracker = newNegativeAcksTracker(pc, options.nackRedeliveryDelay, pc.log)
+	if options.enableCumulativeAcks {
+		pc.cAckTracker = newCumulativeAcksTracker(options.receiverQueueSize, pc.log)
+	}
 
 	err := pc.grabConn()
 	if err != nil {
@@ -304,6 +310,30 @@ func (pc *partitionConsumer) AckID(msgID trackingMessageID) {
 		processingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
 		req := &ackRequest{
 			msgID: msgID,
+		}
+		pc.eventsCh <- req
+
+		pc.options.interceptors.OnAcknowledge(pc.parentConsumer, msgID)
+	}
+}
+
+func (pc *partitionConsumer) AckCumulativeID(msgID trackingMessageID) {
+	if pc.cAckTracker == nil {
+		pc.log.Error("Cumulative ACK support is not enabled")
+		return
+	}
+
+	if !msgID.Undefined() {
+		ackMsgID := pc.cAckTracker.getCumulativeMessageID(&msgID)
+		if ackMsgID == nil {
+			pc.log.Debugf("Was asked to cumulative ACK message %+v, but no suitable message to ACK was found", msgID)
+			return
+		}
+
+		acksCounter.Inc()
+		processingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
+		req := &ackCumulativeRequest{
+			msgID: *ackMsgID,
 		}
 		pc.eventsCh <- req
 
@@ -452,6 +482,34 @@ func (pc *partitionConsumer) internalAck(req *ackRequest) {
 	}
 
 	pc.client.rpcClient.RequestOnCnxNoWait(pc.conn, pb.BaseCommand_ACK, cmdAck)
+
+	// let the cumulative ACK tracker (if enabled) know that we sent an individual ACK
+	// done here because it's possible that ACK command will return a response in the future
+	if pc.cAckTracker != nil {
+		pc.cAckTracker.ackSent(&msgID)
+	}
+}
+
+func (pc *partitionConsumer) internalAckCumulative(ack *ackCumulativeRequest) {
+	msgID := ack.msgID
+
+	messageIDs := make([]*pb.MessageIdData, 1)
+	messageIDs[0] = &pb.MessageIdData{
+		LedgerId: proto.Uint64(uint64(msgID.ledgerID)),
+		EntryId:  proto.Uint64(uint64(msgID.entryID)),
+	}
+
+	cmdCumulativeAck := &pb.CommandAck{
+		ConsumerId: proto.Uint64(pc.consumerID),
+		MessageId:  messageIDs,
+		AckType:    pb.CommandAck_Cumulative.Enum(),
+	}
+
+	pc.client.rpcClient.RequestOnCnxNoWait(pc.conn, pb.BaseCommand_ACK, cmdCumulativeAck)
+
+	// let the cumulative ACK tracker know that we sent a cumulative ACK
+	// done here because it's possible that ACK command will return a response in the future
+	pc.cAckTracker.cumulativeAckSent(&msgID)
 }
 
 func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, headersAndPayload internal.Buffer) error {
@@ -477,7 +535,7 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 	if msgMeta.NumMessagesInBatch != nil {
 		numMsgs = int(msgMeta.GetNumMessagesInBatch())
 	}
-	messages := make([]*message, 0)
+	messages := make([]*message, 0, numMsgs)
 	var ackTracker *ackTracker
 	// are there multiple messages in this batch?
 	if numMsgs > 1 {
@@ -486,6 +544,12 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 
 	messagesReceived.Add(float64(numMsgs))
 	prefetchedMessages.Add(float64(numMsgs))
+
+	// cumulative ACKs support
+	var msgIDs []*trackingMessageID
+	if pc.cAckTracker != nil {
+		msgIDs = make([]*trackingMessageID, 0, numMsgs)
+	}
 
 	for i := 0; i < numMsgs; i++ {
 		smm, payload, err := reader.ReadMessage()
@@ -511,6 +575,12 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 
 		// set the consumer so we know how to ack the message id
 		msgID.consumer = pc
+
+		// accumulate message IDs if cumulative ACKs support is enabled
+		if pc.cAckTracker != nil {
+			msgIDs = append(msgIDs, &msgID)
+		}
+
 		var msg *message
 		if smm != nil {
 			msg = &message{
@@ -550,6 +620,11 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		})
 
 		messages = append(messages, msg)
+	}
+
+	// keep track of message IDs if cumulative ACKs support is enabled
+	if pc.cAckTracker != nil {
+		pc.cAckTracker.messagesReceived(msgIDs)
 	}
 
 	// send messages to the dispatcher
@@ -705,6 +780,10 @@ type ackRequest struct {
 	msgID trackingMessageID
 }
 
+type ackCumulativeRequest struct {
+	msgID trackingMessageID
+}
+
 type unsubscribeRequest struct {
 	doneCh chan struct{}
 	err    error
@@ -759,6 +838,8 @@ func (pc *partitionConsumer) runEventsLoop() {
 			switch v := i.(type) {
 			case *ackRequest:
 				pc.internalAck(v)
+			case *ackCumulativeRequest:
+				pc.internalAckCumulative(v)
 			case *redeliveryRequest:
 				pc.internalRedeliver(v)
 			case *unsubscribeRequest:
