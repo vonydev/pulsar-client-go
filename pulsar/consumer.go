@@ -155,6 +155,8 @@ type ConsumerOptions struct {
 
 	// MaxReconnectToBroker set the maximum retry number of reconnectToBroker. (default: ultimate)
 	MaxReconnectToBroker *uint
+
+	EnableCumulativeAcks bool
 }
 
 // Consumer is an interface that abstracts behavior of Pulsar's consumer
