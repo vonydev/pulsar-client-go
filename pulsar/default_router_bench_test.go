@@ -15,48 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package auth
+package pulsar
 
 import (
-	"crypto/tls"
-	"net/http"
+	"testing"
+	"time"
+
+	"github.com/apache/pulsar-client-go/pulsar/internal"
 )
 
-type disabled struct{}
+var (
+	targetPartition int
+)
 
-// NewAuthDisabled return a interface of Provider
-func NewAuthDisabled() Provider {
-	return &disabled{}
-}
-
-func (disabled) Init() error {
-	return nil
-}
-
-func (disabled) GetData() ([]byte, error) {
-	return nil, nil
-}
-
-func (disabled) Name() string {
-	return ""
-}
-
-func (disabled) GetTLSCertificate() (*tls.Certificate, error) {
-	return nil, nil
-}
-
-func (disabled) Close() error {
-	return nil
-}
-
-func (d disabled) RoundTrip(req *http.Request) (*http.Response, error) {
-	return nil, nil
-}
-
-func (d disabled) Transport() http.RoundTripper {
-	return nil
-}
-
-func (d disabled) WithTransport(tripper http.RoundTripper) error {
-	return nil
+func BenchmarkDefaultRouter(b *testing.B) {
+	const (
+		numPartitions       = uint32(200)
+		maxBatchingMessages = 2000
+		maxBatchingSize     = 524288
+		maxBatchingDelay    = 100 * time.Millisecond
+	)
+	msg := &ProducerMessage{
+		Payload: []byte("message 1"),
+	}
+	router := NewDefaultRouter(internal.JavaStringHash, maxBatchingMessages, maxBatchingSize, maxBatchingDelay, false)
+	for i := 0; i < b.N; i++ {
+		targetPartition = router(msg, numPartitions)
+	}
 }

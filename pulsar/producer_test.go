@@ -78,7 +78,7 @@ func TestProducerNoTopic(t *testing.T) {
 	assert.Nil(t, producer)
 	assert.NotNil(t, err)
 
-	assert.Equal(t, err.(*Error).Result(), ResultInvalidTopicName)
+	assert.Equal(t, InvalidTopicName, err.(*Error).Result())
 }
 
 func TestSimpleProducer(t *testing.T) {
@@ -621,7 +621,7 @@ func TestProducerMetadata(t *testing.T) {
 	}
 	producer, err := client.CreateProducer(ProducerOptions{
 		Topic:      topic,
-		Name:       "my-producer",
+		Name:       "meta-data-producer",
 		Properties: props,
 	})
 	if err != nil {
@@ -880,6 +880,54 @@ func TestMaxMessageSize(t *testing.T) {
 			assert.Equal(t, errMessageTooLarge, err)
 		}
 	}
+}
+
+func TestSendTimeout(t *testing.T) {
+	quotaURL := adminURL + "/admin/v2/namespaces/public/default/backlogQuota"
+	quotaFmt := `{"limit": "%d", "policy": "producer_request_hold"}`
+	makeHTTPCall(t, http.MethodPost, quotaURL, fmt.Sprintf(quotaFmt, 10*1024))
+
+	client, err := NewClient(ClientOptions{
+		URL: serviceURL,
+	})
+	assert.NoError(t, err)
+	defer client.Close()
+
+	topicName := newTopicName()
+	consumer, err := client.Subscribe(ConsumerOptions{
+		Topic:            topicName,
+		SubscriptionName: "send_timeout_sub",
+	})
+	assert.Nil(t, err)
+	defer consumer.Close() // subscribe but do nothing
+
+	noRetry := uint(0)
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:                topicName,
+		SendTimeout:          2 * time.Second,
+		MaxReconnectToBroker: &noRetry,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	for i := 0; i < 10; i++ {
+		id, err := producer.Send(context.Background(), &ProducerMessage{
+			Payload: make([]byte, 1024),
+		})
+		assert.Nil(t, err)
+		assert.NotNil(t, id)
+	}
+
+	// waiting for the backlog check
+	time.Sleep((5 + 1) * time.Second)
+
+	id, err := producer.Send(context.Background(), &ProducerMessage{
+		Payload: make([]byte, 1024),
+	})
+	assert.NotNil(t, err)
+	assert.Nil(t, id)
+
+	makeHTTPCall(t, http.MethodDelete, quotaURL, "")
 }
 
 type noopProduceInterceptor struct{}

@@ -19,39 +19,16 @@ package pulsar
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
 	"github.com/apache/pulsar-client-go/pulsar/internal"
 	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 	"github.com/apache/pulsar-client-go/pulsar/log"
 )
-
-var (
-	consumersOpened = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_consumers_opened",
-		Help: "Counter of consumers created by the client",
-	})
-
-	consumersClosed = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_consumers_closed",
-		Help: "Counter of consumers closed by the client",
-	})
-
-	consumersPartitions = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "pulsar_client_consumers_partitions_active",
-		Help: "Counter of individual partitions the consumers are currently active",
-	})
-)
-
-var ErrConsumerClosed = errors.New("consumer closed")
 
 const defaultNackRedeliveryDelay = 1 * time.Minute
 
@@ -73,14 +50,15 @@ type consumer struct {
 	// channel used to deliver message to clients
 	messageCh chan ConsumerMessage
 
-	dlq       *dlqRouter
-	rlq       *retryRouter
-	closeOnce sync.Once
-	closeCh   chan struct{}
-	errorCh   chan error
-	ticker    *time.Ticker
+	dlq           *dlqRouter
+	rlq           *retryRouter
+	closeOnce     sync.Once
+	closeCh       chan struct{}
+	errorCh       chan error
+	stopDiscovery func()
 
-	log log.Logger
+	log     log.Logger
+	metrics *internal.TopicMetrics
 }
 
 func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
@@ -161,6 +139,8 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		return nil, err
 	}
 
+	// normalize as FQDN topics
+	var tns []*internal.TopicName
 	// single topic consumer
 	if options.Topic != "" || len(options.Topics) == 1 {
 		topic := options.Topic
@@ -168,17 +148,21 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 			topic = options.Topics[0]
 		}
 
-		if err := validateTopicNames(topic); err != nil {
+		if tns, err = validateTopicNames(topic); err != nil {
 			return nil, err
 		}
-
+		topic = tns[0].Name
 		return topicSubscribe(client, options, topic, messageCh, dlq, rlq)
 	}
 
 	if len(options.Topics) > 1 {
-		if err := validateTopicNames(options.Topics...); err != nil {
+		if tns, err = validateTopicNames(options.Topics...); err != nil {
 			return nil, err
 		}
+		for i := range options.Topics {
+			options.Topics[i] = tns[i].Name
+		}
+		options.Topics = distinct(options.Topics)
 
 		return newMultiTopicConsumer(client, options, options.Topics, messageCh, dlq, rlq)
 	}
@@ -196,7 +180,7 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		return newRegexConsumer(client, options, tn, pattern, messageCh, dlq, rlq)
 	}
 
-	return nil, newError(ResultInvalidTopicName, "topic name is required for consumer")
+	return nil, newError(InvalidTopicName, "topic name is required for consumer")
 }
 
 func newInternalConsumer(client *client, options ConsumerOptions, topic string,
@@ -214,6 +198,7 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 		rlq:                       rlq,
 		log:                       client.log.SubLogger(log.Fields{"topic": topic}),
 		consumerName:              options.Name,
+		metrics:                   client.metrics.GetTopicMetrics(topic),
 	}
 
 	err := consumer.internalTopicSubscribeToPartitions()
@@ -226,14 +211,7 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 	if duration <= 0 {
 		duration = defaultAutoDiscoveryDuration
 	}
-	consumer.ticker = time.NewTicker(duration)
-
-	go func() {
-		for range consumer.ticker.C {
-			consumer.log.Debug("Auto discovering new partitions")
-			consumer.internalTopicSubscribeToPartitions()
-		}
-	}()
+	consumer.stopDiscovery = consumer.runBackgroundPartitionDiscovery(duration)
 
 	return consumer, nil
 }
@@ -241,6 +219,32 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 // Name returns the name of consumer.
 func (c *consumer) Name() string {
 	return c.consumerName
+}
+
+func (c *consumer) runBackgroundPartitionDiscovery(period time.Duration) (cancel func()) {
+	var wg sync.WaitGroup
+	stopDiscoveryCh := make(chan struct{})
+	ticker := time.NewTicker(period)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopDiscoveryCh:
+				return
+			case <-ticker.C:
+				c.log.Debug("Auto discovering new partitions")
+				c.internalTopicSubscribeToPartitions()
+			}
+		}
+	}()
+
+	return func() {
+		ticker.Stop()
+		close(stopDiscoveryCh)
+		wg.Wait()
+	}
 }
 
 func (c *consumer) internalTopicSubscribeToPartitions() error {
@@ -321,7 +325,7 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 				schema:                     c.options.Schema,
 				enableCumulativeAcks:       c.options.EnableCumulativeAcks,
 			}
-			cons, err := newPartitionConsumer(c, c.client, opts, c.messageCh, c.dlq)
+			cons, err := newPartitionConsumer(c, c.client, opts, c.messageCh, c.dlq, c.metrics)
 			ch <- ConsumerError{
 				err:       err,
 				partition: idx,
@@ -354,7 +358,7 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 		return err
 	}
 
-	consumersPartitions.Add(float64(partitionsToAdd))
+	c.metrics.ConsumersPartitions.Add(float64(partitionsToAdd))
 	return nil
 }
 
@@ -362,7 +366,7 @@ func topicSubscribe(client *client, options ConsumerOptions, topic string,
 	messageCh chan ConsumerMessage, dlqRouter *dlqRouter, retryRouter *retryRouter) (Consumer, error) {
 	c, err := newInternalConsumer(client, options, topic, messageCh, dlqRouter, retryRouter, false)
 	if err == nil {
-		consumersOpened.Inc()
+		c.metrics.ConsumersOpened.Inc()
 	}
 	return c, err
 }
@@ -391,10 +395,10 @@ func (c *consumer) Receive(ctx context.Context) (message Message, err error) {
 	for {
 		select {
 		case <-c.closeCh:
-			return nil, ErrConsumerClosed
+			return nil, newError(ConsumerClosed, "consumer closed")
 		case cm, ok := <-c.messageCh:
 			if !ok {
-				return nil, ErrConsumerClosed
+				return nil, newError(ConsumerClosed, "consumer closed")
 			}
 			return cm.Message, nil
 		case <-ctx.Done():
@@ -489,6 +493,7 @@ func (c *consumer) ReconsumeLater(msg Message, delay time.Duration) {
 			producerMsg: ProducerMessage{
 				Payload:      msg.Payload(),
 				Key:          msg.Key(),
+				OrderingKey:  msg.OrderingKey(),
 				Properties:   props,
 				DeliverAfter: delay,
 			},
@@ -516,6 +521,8 @@ func (c *consumer) NackID(msgID MessageID) {
 
 func (c *consumer) Close() {
 	c.closeOnce.Do(func() {
+		c.stopDiscovery()
+
 		c.Lock()
 		defer c.Unlock()
 
@@ -529,12 +536,11 @@ func (c *consumer) Close() {
 		}
 		wg.Wait()
 		close(c.closeCh)
-		c.ticker.Stop()
 		c.client.handlers.Del(c)
 		c.dlq.close()
 		c.rlq.close()
-		consumersClosed.Inc()
-		consumersPartitions.Sub(float64(len(c.consumers)))
+		c.metrics.ConsumersClosed.Inc()
+		c.metrics.ConsumersPartitions.Sub(float64(len(c.consumers)))
 	})
 }
 
@@ -543,7 +549,7 @@ func (c *consumer) Seek(msgID MessageID) error {
 	defer c.Unlock()
 
 	if len(c.consumers) > 1 {
-		return errors.New("for partition topic, seek command should perform on the individual partitions")
+		return newError(SeekFailed, "for partition topic, seek command should perform on the individual partitions")
 	}
 
 	mid, ok := c.messageID(msgID)
@@ -558,7 +564,7 @@ func (c *consumer) SeekByTime(time time.Time) error {
 	c.Lock()
 	defer c.Unlock()
 	if len(c.consumers) > 1 {
-		return errors.New("for partition topic, seek command should perform on the individual partitions")
+		return newError(SeekFailed, "for partition topic, seek command should perform on the individual partitions")
 	}
 
 	return c.consumers[0].SeekByTime(time)
@@ -582,6 +588,18 @@ func generateRandomName() string {
 		bytes[i] = chars[r.R.Intn(len(chars))]
 	}
 	return string(bytes)
+}
+
+func distinct(fqdnTopics []string) []string {
+	set := make(map[string]struct{})
+	uniques := make([]string, 0, len(fqdnTopics))
+	for _, topic := range fqdnTopics {
+		if _, ok := set[topic]; !ok {
+			set[topic] = struct{}{}
+			uniques = append(uniques, topic)
+		}
+	}
+	return uniques
 }
 
 func toProtoSubType(st SubscriptionType) pb.CommandSubscribe_SubType {

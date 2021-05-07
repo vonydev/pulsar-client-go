@@ -312,6 +312,26 @@ func TestReaderOnLatestWithBatching(t *testing.T) {
 	cancel()
 }
 
+func TestReaderHasNextAgainstEmptyTopic(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	// create reader on 5th message (not included)
+	reader, err := client.CreateReader(ReaderOptions{
+		Topic:          "an-empty-topic",
+		StartMessageID: EarliestMessageID(),
+	})
+
+	assert.Nil(t, err)
+	defer reader.Close()
+
+	assert.Equal(t, reader.HasNext(), false)
+}
+
 func TestReaderHasNext(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		URL: lookupURL,
@@ -557,10 +577,64 @@ func TestReaderLatestInclusiveHasNext(t *testing.T) {
 	assert.Nil(t, err)
 	defer reader.Close()
 
-	if reader.HasNext() {
+	assert.True(t, reader.HasNext())
+	msg, err := reader.Next(context.Background())
+	assert.NoError(t, err)
+
+	assert.Equal(t, []byte("hello-9"), msg.Payload())
+	assert.Equal(t, lastMsgID.Serialize(), msg.ID().Serialize())
+
+	assert.False(t, reader.HasNext())
+}
+
+func TestReaderWithMultiHosts(t *testing.T) {
+	// Multi hosts included an unreached port and the actual port for verify retry logic
+	client, err := NewClient(ClientOptions{
+		URL: "pulsar://localhost:6600,localhost:6650",
+	})
+
+	assert.Nil(t, err)
+	defer client.Close()
+
+	topic := newTopicName()
+	ctx := context.Background()
+
+	// create producer
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:           topic,
+		DisableBatching: true,
+	})
+	assert.Nil(t, err)
+	defer producer.Close()
+
+	// send 10 messages
+	for i := 0; i < 10; i++ {
+		msgID, err := producer.Send(ctx, &ProducerMessage{
+			Payload: []byte(fmt.Sprintf("hello-%d", i)),
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, msgID)
+	}
+
+	// create reader on 5th message (not included)
+	reader, err := client.CreateReader(ReaderOptions{
+		Topic:          topic,
+		StartMessageID: EarliestMessageID(),
+	})
+
+	assert.Nil(t, err)
+	defer reader.Close()
+
+	i := 0
+	for reader.HasNext() {
 		msg, err := reader.Next(context.Background())
 		assert.NoError(t, err)
 
-		assert.Equal(t, []byte("hello-9"), msg.Payload())
+		expectMsg := fmt.Sprintf("hello-%d", i)
+		assert.Equal(t, []byte(expectMsg), msg.Payload())
+
+		i++
 	}
+
+	assert.Equal(t, 10, i)
 }

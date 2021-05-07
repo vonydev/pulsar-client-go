@@ -24,14 +24,14 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
 	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 const (
+	// defaultSendTimeout init default timeout for ack since sent.
+	defaultSendTimeout = 30 * time.Second
+
 	// defaultBatchingMaxPublishDelay init default for maximum delay to batch messages
 	defaultBatchingMaxPublishDelay = 10 * time.Millisecond
 
@@ -40,23 +40,6 @@ const (
 
 	// defaultMaxMessagesPerBatch init default num of entries in per batch.
 	defaultMaxMessagesPerBatch = 1000
-)
-
-var (
-	producersOpened = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_producers_opened",
-		Help: "Counter of producers created by the client",
-	})
-
-	producersClosed = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_producers_closed",
-		Help: "Counter of producers closed by the client",
-	})
-
-	producersPartitions = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "pulsar_client_producers_partitions_active",
-		Help: "Counter of individual partitions the producers are currently active",
-	})
 )
 
 type producer struct {
@@ -68,9 +51,10 @@ type producer struct {
 	producersPtr  unsafe.Pointer
 	numPartitions uint32
 	messageRouter func(*ProducerMessage, TopicMetadata) int
-	ticker        *time.Ticker
-	tickerStop    chan struct{}
+	closeOnce     sync.Once
+	stopDiscovery func()
 	log           log.Logger
+	metrics       *internal.TopicMetrics
 }
 
 var partitionsAutoDiscoveryInterval = 1 * time.Minute
@@ -88,16 +72,19 @@ func getHashingFunction(s HashingScheme) func(string) uint32 {
 
 func newProducer(client *client, options *ProducerOptions) (*producer, error) {
 	if options.Topic == "" {
-		return nil, newError(ResultInvalidTopicName, "Topic name is required for producer")
+		return nil, newError(InvalidTopicName, "Topic name is required for producer")
 	}
 
+	if options.SendTimeout == 0 {
+		options.SendTimeout = defaultSendTimeout
+	}
 	if options.BatchingMaxMessages == 0 {
 		options.BatchingMaxMessages = defaultMaxMessagesPerBatch
 	}
 	if options.BatchingMaxSize == 0 {
 		options.BatchingMaxSize = defaultMaxBatchSize
 	}
-	if options.BatchingMaxPublishDelay == 0 {
+	if options.BatchingMaxPublishDelay <= 0 {
 		options.BatchingMaxPublishDelay = defaultBatchingMaxPublishDelay
 	}
 
@@ -106,6 +93,7 @@ func newProducer(client *client, options *ProducerOptions) (*producer, error) {
 		topic:   options.Topic,
 		client:  client,
 		log:     client.log.SubLogger(log.Fields{"topic": options.Topic}),
+		metrics: client.metrics.GetTopicMetrics(options.Topic),
 	}
 
 	if options.Interceptors == nil {
@@ -137,24 +125,36 @@ func newProducer(client *client, options *ProducerOptions) (*producer, error) {
 		return nil, err
 	}
 
-	ticker := time.NewTicker(partitionsAutoDiscoveryInterval)
-	p.ticker = ticker
-	p.tickerStop = make(chan struct{})
+	p.stopDiscovery = p.runBackgroundPartitionDiscovery(partitionsAutoDiscoveryInterval)
 
+	p.metrics.ProducersOpened.Inc()
+	return p, nil
+}
+
+func (p *producer) runBackgroundPartitionDiscovery(period time.Duration) (cancel func()) {
+	var wg sync.WaitGroup
+	stopDiscoveryCh := make(chan struct{})
+	ticker := time.NewTicker(period)
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
+			case <-stopDiscoveryCh:
+				return
 			case <-ticker.C:
 				p.log.Debug("Auto discovering new partitions")
 				p.internalCreatePartitionsProducers()
-			case <-p.tickerStop:
-				return
 			}
 		}
 	}()
 
-	producersOpened.Inc()
-	return p, nil
+	return func() {
+		ticker.Stop()
+		close(stopDiscoveryCh)
+		wg.Wait()
+	}
 }
 
 func (p *producer) internalCreatePartitionsProducers() error {
@@ -203,7 +203,7 @@ func (p *producer) internalCreatePartitionsProducers() error {
 		partition := partitions[partitionIdx]
 
 		go func(partitionIdx int, partition string) {
-			prod, e := newPartitionProducer(p.client, partition, p.options, partitionIdx)
+			prod, e := newPartitionProducer(p.client, partition, p.options, partitionIdx, p.metrics)
 			c <- ProducerError{
 				partition: partitionIdx,
 				prod:      prod,
@@ -233,7 +233,7 @@ func (p *producer) internalCreatePartitionsProducers() error {
 		return err
 	}
 
-	producersPartitions.Add(float64(partitionsToAdd))
+	p.metrics.ProducersPartitions.Add(float64(partitionsToAdd))
 	atomic.StorePointer(&p.producersPtr, unsafe.Pointer(&p.producers))
 	atomic.StoreUint32(&p.numPartitions, uint32(len(p.producers)))
 	return nil
@@ -304,18 +304,17 @@ func (p *producer) Flush() error {
 }
 
 func (p *producer) Close() {
-	p.Lock()
-	defer p.Unlock()
-	if p.ticker != nil {
-		p.ticker.Stop()
-		close(p.tickerStop)
-		p.ticker = nil
-	}
+	p.closeOnce.Do(func() {
+		p.stopDiscovery()
 
-	for _, pp := range p.producers {
-		pp.Close()
-	}
-	p.client.handlers.Del(p)
-	producersPartitions.Sub(float64(len(p.producers)))
-	producersClosed.Inc()
+		p.Lock()
+		defer p.Unlock()
+
+		for _, pp := range p.producers {
+			pp.Close()
+		}
+		p.client.handlers.Del(p)
+		p.metrics.ProducersPartitions.Sub(float64(len(p.producers)))
+		p.metrics.ProducersClosed.Inc()
+	})
 }

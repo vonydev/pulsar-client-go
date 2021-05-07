@@ -19,11 +19,11 @@ package pulsar
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/apache/pulsar-client-go/pulsar/internal"
 	pkgerrors "github.com/pkg/errors"
 
 	"github.com/apache/pulsar-client-go/pulsar/log"
@@ -74,7 +74,6 @@ func newMultiTopicConsumer(client *client, options ConsumerOptions, topics []str
 		return nil, errs
 	}
 
-	consumersOpened.Inc()
 	return mtc, nil
 }
 
@@ -98,10 +97,10 @@ func (c *multiTopicConsumer) Receive(ctx context.Context) (message Message, err 
 	for {
 		select {
 		case <-c.closeCh:
-			return nil, ErrConsumerClosed
+			return nil, newError(ConsumerClosed, "consumer closed")
 		case cm, ok := <-c.messageCh:
 			if !ok {
-				return nil, ErrConsumerClosed
+				return nil, newError(ConsumerClosed, "consumer closed")
 			}
 			return cm.Message, nil
 		case <-ctx.Done():
@@ -153,7 +152,18 @@ func (c *multiTopicConsumer) AckCumulativeID(msgID MessageID) {
 }
 
 func (c *multiTopicConsumer) ReconsumeLater(msg Message, delay time.Duration) {
-	consumer, ok := c.consumers[msg.Topic()]
+	names, err := validateTopicNames(msg.Topic())
+	if err != nil {
+		c.log.Errorf("validate msg topic %q failed: %v", msg.Topic(), err)
+		return
+	}
+	if len(names) != 1 {
+		c.log.Errorf("invalid msg topic %q names: %+v ", msg.Topic(), names)
+		return
+	}
+
+	fqdnTopic := internal.TopicNameWithoutPartitionPart(names[0])
+	consumer, ok := c.consumers[fqdnTopic]
 	if !ok {
 		c.log.Warnf("consumer of topic %s not exist unexpectedly", msg.Topic())
 		return
@@ -194,16 +204,15 @@ func (c *multiTopicConsumer) Close() {
 		close(c.closeCh)
 		c.dlq.close()
 		c.rlq.close()
-		consumersClosed.Inc()
 	})
 }
 
 func (c *multiTopicConsumer) Seek(msgID MessageID) error {
-	return errors.New("seek command not allowed for multi topic consumer")
+	return newError(SeekFailed, "seek command not allowed for multi topic consumer")
 }
 
 func (c *multiTopicConsumer) SeekByTime(time time.Time) error {
-	return errors.New("seek command not allowed for multi topic consumer")
+	return newError(SeekFailed, "seek command not allowed for multi topic consumer")
 }
 
 // Name returns the name of consumer.

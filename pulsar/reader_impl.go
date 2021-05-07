@@ -23,26 +23,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
+	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 const (
 	defaultReceiverQueueSize = 1000
-)
-
-var (
-	readersOpened = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_readers_opened",
-		Help: "Counter of readers created by the client",
-	})
-
-	readersClosed = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_readers_closed",
-		Help: "Counter of readers closed by the client",
-	})
 )
 
 type reader struct {
@@ -51,15 +37,16 @@ type reader struct {
 	messageCh           chan ConsumerMessage
 	lastMessageInBroker trackingMessageID
 	log                 log.Logger
+	metrics             *internal.TopicMetrics
 }
 
 func newReader(client *client, options ReaderOptions) (Reader, error) {
 	if options.Topic == "" {
-		return nil, newError(ResultInvalidConfiguration, "Topic is required")
+		return nil, newError(InvalidConfiguration, "Topic is required")
 	}
 
 	if options.StartMessageID == nil {
-		return nil, newError(ResultInvalidConfiguration, "StartMessageID is required")
+		return nil, newError(InvalidConfiguration, "StartMessageID is required")
 	}
 
 	startMessageID, ok := toTrackingMessageID(options.StartMessageID)
@@ -106,6 +93,7 @@ func newReader(client *client, options ReaderOptions) (Reader, error) {
 	reader := &reader{
 		messageCh: make(chan ConsumerMessage),
 		log:       client.log.SubLogger(log.Fields{"topic": options.Topic}),
+		metrics:   client.metrics.GetTopicMetrics(options.Topic),
 	}
 
 	// Provide dummy dlq router with not dlq policy
@@ -114,14 +102,14 @@ func newReader(client *client, options ReaderOptions) (Reader, error) {
 		return nil, err
 	}
 
-	pc, err := newPartitionConsumer(nil, client, consumerOptions, reader.messageCh, dlq)
+	pc, err := newPartitionConsumer(nil, client, consumerOptions, reader.messageCh, dlq, reader.metrics)
 	if err != nil {
 		close(reader.messageCh)
 		return nil, err
 	}
 
 	reader.pc = pc
-	readersOpened.Inc()
+	reader.metrics.ReadersOpened.Inc()
 	return reader, nil
 }
 
@@ -134,7 +122,7 @@ func (r *reader) Next(ctx context.Context) (Message, error) {
 		select {
 		case cm, ok := <-r.messageCh:
 			if !ok {
-				return nil, ErrConsumerClosed
+				return nil, newError(ConsumerClosed, "consumer closed")
 			}
 
 			// Acknowledge message immediately because the reader is based on non-durable subscription. When it reconnects,
@@ -145,7 +133,7 @@ func (r *reader) Next(ctx context.Context) (Message, error) {
 				r.pc.AckID(mid)
 				return cm.Message, nil
 			}
-			return nil, fmt.Errorf("invalid message id type %T", msgID)
+			return nil, newError(InvalidMessage, fmt.Sprintf("invalid message id type %T", msgID))
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -173,20 +161,20 @@ func (r *reader) HasNext() bool {
 
 func (r *reader) hasMoreMessages() bool {
 	if !r.pc.lastDequeuedMsg.Undefined() {
-		return r.lastMessageInBroker.greater(r.pc.lastDequeuedMsg.messageID)
+		return r.lastMessageInBroker.isEntryIDValid() && r.lastMessageInBroker.greater(r.pc.lastDequeuedMsg.messageID)
 	}
 
 	if r.pc.options.startMessageIDInclusive {
-		return r.lastMessageInBroker.greaterEqual(r.pc.startMessageID.messageID)
+		return r.lastMessageInBroker.isEntryIDValid() && r.lastMessageInBroker.greaterEqual(r.pc.startMessageID.messageID)
 	}
 
 	// Non-inclusive
-	return r.lastMessageInBroker.greater(r.pc.startMessageID.messageID)
+	return r.lastMessageInBroker.isEntryIDValid() && r.lastMessageInBroker.greater(r.pc.startMessageID.messageID)
 }
 
 func (r *reader) Close() {
 	r.pc.Close()
-	readersClosed.Inc()
+	r.metrics.ReadersClosed.Inc()
 }
 
 func (r *reader) messageID(msgID MessageID) (trackingMessageID, bool) {

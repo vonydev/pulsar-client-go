@@ -44,6 +44,7 @@ type connectionPool struct {
 	auth                  auth.Provider
 	maxConnectionsPerHost int32
 	roundRobinCnt         int32
+	metrics               *Metrics
 
 	log log.Logger
 }
@@ -54,13 +55,15 @@ func NewConnectionPool(
 	auth auth.Provider,
 	connectionTimeout time.Duration,
 	maxConnectionsPerHost int,
-	logger log.Logger) ConnectionPool {
+	logger log.Logger,
+	metrics *Metrics) ConnectionPool {
 	return &connectionPool{
 		tlsOptions:            tlsOptions,
 		auth:                  auth,
 		connectionTimeout:     connectionTimeout,
 		maxConnectionsPerHost: int32(maxConnectionsPerHost),
 		log:                   logger,
+		metrics:               metrics,
 	}
 }
 
@@ -88,6 +91,7 @@ func (p *connectionPool) GetConnection(logicalAddr *url.URL, physicalAddr *url.U
 		connectionTimeout: p.connectionTimeout,
 		auth:              p.auth,
 		logger:            p.log,
+		metrics:           p.metrics,
 	})
 	newCnx, wasCached := p.pool.LoadOrStore(key, newConnection)
 	cnx := newCnx.(*connection)
@@ -99,6 +103,10 @@ func (p *connectionPool) GetConnection(logicalAddr *url.URL, physicalAddr *url.U
 	}
 
 	if err := cnx.waitUntilReady(); err != nil {
+		if !wasCached {
+			p.pool.Delete(key)
+			p.log.Debug("Removed failed connection from pool:", cnx.logicalAddr, cnx.physicalAddr)
+		}
 		return nil, err
 	}
 	return cnx, nil

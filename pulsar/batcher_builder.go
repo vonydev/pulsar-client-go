@@ -15,48 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package auth
+package pulsar
 
 import (
-	"crypto/tls"
-	"net/http"
+	"github.com/apache/pulsar-client-go/pulsar/internal"
 )
 
-type disabled struct{}
+type BatcherBuilderType int
 
-// NewAuthDisabled return a interface of Provider
-func NewAuthDisabled() Provider {
-	return &disabled{}
-}
+const (
+	DefaultBatchBuilder BatcherBuilderType = iota
+	KeyBasedBatchBuilder
+)
 
-func (disabled) Init() error {
-	return nil
-}
-
-func (disabled) GetData() ([]byte, error) {
-	return nil, nil
-}
-
-func (disabled) Name() string {
-	return ""
-}
-
-func (disabled) GetTLSCertificate() (*tls.Certificate, error) {
-	return nil, nil
-}
-
-func (disabled) Close() error {
-	return nil
-}
-
-func (d disabled) RoundTrip(req *http.Request) (*http.Response, error) {
-	return nil, nil
-}
-
-func (d disabled) Transport() http.RoundTripper {
-	return nil
-}
-
-func (d disabled) WithTransport(tripper http.RoundTripper) error {
-	return nil
+func GetBatcherBuilderProvider(typ BatcherBuilderType) (
+	internal.BatcherBuilderProvider, error,
+) {
+	switch typ {
+	case DefaultBatchBuilder:
+		return internal.NewBatchBuilder, nil
+	case KeyBasedBatchBuilder:
+		return internal.NewKeyBasedBatchBuilder, nil
+	default:
+		return nil, newError(InvalidBatchBuilderType, "unsupported batcher builder provider type")
+	}
 }

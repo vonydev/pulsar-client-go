@@ -23,70 +23,44 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
 	"github.com/gogo/protobuf/proto"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"github.com/apache/pulsar-client-go/pulsar/internal/compression"
 	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 	"github.com/apache/pulsar-client-go/pulsar/log"
+
+	"go.uber.org/atomic"
 )
 
 var (
-	messagesReceived = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_messages_received",
-		Help: "Counter of messages received by the client",
-	})
-
-	bytesReceived = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_bytes_received",
-		Help: "Counter of bytes received by the client",
-	})
-
-	prefetchedMessages = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "pulsar_client_consumer_prefetched_messages",
-		Help: "Number of messages currently sitting in the consumer pre-fetch queue",
-	})
-
-	prefetchedBytes = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "pulsar_client_consumer_prefetched_bytes",
-		Help: "Total number of bytes currently sitting in the consumer pre-fetch queue",
-	})
-
-	acksCounter = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_consumer_acks",
-		Help: "Counter of messages acked by client",
-	})
-
-	nacksCounter = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_consumer_nacks",
-		Help: "Counter of messages nacked by client",
-	})
-
-	dlqCounter = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_consumer_dlq_messages",
-		Help: "Counter of messages sent to Dead letter queue",
-	})
-
-	processingTime = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "pulsar_client_consumer_processing_time_seconds",
-		Help:    "Time it takes for application to process messages",
-		Buckets: []float64{.0005, .001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
-	})
-
 	lastestMessageID = LatestMessageID()
 )
 
 type consumerState int
 
 const (
-	consumerInit consumerState = iota
+	// consumer states
+	consumerInit = iota
 	consumerReady
 	consumerClosing
 	consumerClosed
 )
+
+func (s consumerState) String() string {
+	switch s {
+	case consumerInit:
+		return "Initializing"
+	case consumerReady:
+		return "Ready"
+	case consumerClosing:
+		return "Closing"
+	case consumerClosed:
+		return "Closed"
+	default:
+		return "Unknown"
+	}
+}
 
 type subscriptionMode int
 
@@ -131,7 +105,7 @@ type partitionConsumer struct {
 
 	// this is needed for sending ConsumerMessage on the messageCh
 	parentConsumer Consumer
-	state          consumerState
+	state          atomic.Int32
 	options        *partitionConsumerOpts
 
 	conn internal.Connection
@@ -153,11 +127,12 @@ type partitionConsumer struct {
 	startMessageID  trackingMessageID
 	lastDequeuedMsg trackingMessageID
 
-	eventsCh        chan interface{}
-	connectedCh     chan struct{}
-	connectClosedCh chan connectionClosed
-	closeCh         chan struct{}
-	clearQueueCh    chan func(id trackingMessageID)
+	eventsCh             chan interface{}
+	connectedCh          chan struct{}
+	connectClosedCh      chan connectionClosed
+	closeCh              chan struct{}
+	clearQueueCh         chan func(id trackingMessageID)
+	clearMessageQueuesCh chan chan struct{}
 
 	nackTracker *negativeAcksTracker
 	dlq         *dlqRouter
@@ -167,12 +142,13 @@ type partitionConsumer struct {
 	log log.Logger
 
 	compressionProviders map[pb.CompressionType]compression.Provider
+	metrics              *internal.TopicMetrics
 }
 
 func newPartitionConsumer(parent Consumer, client *client, options *partitionConsumerOpts,
-	messageCh chan ConsumerMessage, dlq *dlqRouter) (*partitionConsumer, error) {
+	messageCh chan ConsumerMessage, dlq *dlqRouter,
+	metrics *internal.TopicMetrics) (*partitionConsumer, error) {
 	pc := &partitionConsumer{
-		state:                consumerInit,
 		parentConsumer:       parent,
 		client:               client,
 		options:              options,
@@ -189,9 +165,12 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 		connectClosedCh:      make(chan connectionClosed, 10),
 		closeCh:              make(chan struct{}),
 		clearQueueCh:         make(chan func(id trackingMessageID)),
+		clearMessageQueuesCh: make(chan chan struct{}),
 		compressionProviders: make(map[pb.CompressionType]compression.Provider),
 		dlq:                  dlq,
+		metrics:              metrics,
 	}
+	pc.setConsumerState(consumerInit)
 	pc.log = client.log.SubLogger(log.Fields{
 		"name":         pc.name,
 		"topic":        options.topic,
@@ -206,21 +185,25 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 	err := pc.grabConn()
 	if err != nil {
 		pc.log.WithError(err).Error("Failed to create consumer")
+		pc.nackTracker.Close()
 		return nil, err
 	}
 	pc.log.Info("Created consumer")
-	pc.state = consumerReady
+	pc.setConsumerState(consumerReady)
 
-	if pc.options.startMessageIDInclusive && pc.startMessageID == lastestMessageID {
+	if pc.options.startMessageIDInclusive && pc.startMessageID.equal(lastestMessageID.(messageID)) {
 		msgID, err := pc.requestGetLastMessageID()
 		if err != nil {
+			pc.nackTracker.Close()
 			return nil, err
 		}
 		if msgID.entryID != noMessageEntry {
 			pc.startMessageID = msgID
 
-			err = pc.requestSeek(msgID.messageID)
+			// use the WithoutClear version because the dispatcher is not started yet
+			err = pc.requestSeekWithoutClear(msgID.messageID)
 			if err != nil {
+				pc.nackTracker.Close()
 				return nil, err
 			}
 		}
@@ -234,6 +217,11 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 }
 
 func (pc *partitionConsumer) Unsubscribe() error {
+	if state := pc.getConsumerState(); state == consumerClosed || state == consumerClosing {
+		pc.log.WithField("state", state).Error("Failed to unsubscribe closing or closed consumer")
+		return nil
+	}
+
 	req := &unsubscribeRequest{doneCh: make(chan struct{})}
 	pc.eventsCh <- req
 
@@ -245,12 +233,12 @@ func (pc *partitionConsumer) Unsubscribe() error {
 func (pc *partitionConsumer) internalUnsubscribe(unsub *unsubscribeRequest) {
 	defer close(unsub.doneCh)
 
-	if pc.state == consumerClosed || pc.state == consumerClosing {
-		pc.log.Error("Failed to unsubscribe consumer, the consumer is closing or consumer has been closed")
+	if state := pc.getConsumerState(); state == consumerClosed || state == consumerClosing {
+		pc.log.WithField("state", state).Error("Failed to unsubscribe closing or closed consumer")
 		return
 	}
 
-	pc.state = consumerClosing
+	pc.setConsumerState(consumerClosing)
 	requestID := pc.client.rpcClient.NewRequestID()
 	cmdUnsubscribe := &pb.CommandUnsubscribe{
 		RequestId:  proto.Uint64(requestID),
@@ -261,7 +249,7 @@ func (pc *partitionConsumer) internalUnsubscribe(unsub *unsubscribeRequest) {
 		pc.log.WithError(err).Error("Failed to unsubscribe consumer")
 		unsub.err = err
 		// Set the state to ready for closing the consumer
-		pc.state = consumerReady
+		pc.setConsumerState(consumerReady)
 		// Should'nt remove the consumer handler
 		return
 	}
@@ -271,7 +259,7 @@ func (pc *partitionConsumer) internalUnsubscribe(unsub *unsubscribeRequest) {
 		pc.nackTracker.Close()
 	}
 	pc.log.Infof("The consumer[%d] successfully unsubscribed", pc.consumerID)
-	pc.state = consumerClosed
+	pc.setConsumerState(consumerClosed)
 }
 
 func (pc *partitionConsumer) getLastMessageID() (trackingMessageID, error) {
@@ -306,8 +294,8 @@ func (pc *partitionConsumer) requestGetLastMessageID() (trackingMessageID, error
 
 func (pc *partitionConsumer) AckID(msgID trackingMessageID) {
 	if !msgID.Undefined() && msgID.ack() {
-		acksCounter.Inc()
-		processingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
+		pc.metrics.AcksCounter.Inc()
+		pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
 		req := &ackRequest{
 			msgID: msgID,
 		}
@@ -343,7 +331,7 @@ func (pc *partitionConsumer) AckCumulativeID(msgID trackingMessageID) {
 
 func (pc *partitionConsumer) NackID(msgID trackingMessageID) {
 	pc.nackTracker.Add(msgID.messageID)
-	nacksCounter.Inc()
+	pc.metrics.NacksCounter.Inc()
 }
 
 func (pc *partitionConsumer) Redeliver(msgIds []messageID) {
@@ -375,8 +363,17 @@ func (pc *partitionConsumer) internalRedeliver(req *redeliveryRequest) {
 		})
 }
 
+func (pc *partitionConsumer) getConsumerState() consumerState {
+	return consumerState(pc.state.Load())
+}
+
+func (pc *partitionConsumer) setConsumerState(state consumerState) {
+	pc.state.Store(int32(state))
+}
+
 func (pc *partitionConsumer) Close() {
-	if pc.state != consumerReady {
+
+	if pc.getConsumerState() != consumerReady {
 		return
 	}
 
@@ -403,10 +400,18 @@ func (pc *partitionConsumer) internalSeek(seek *seekRequest) {
 	defer close(seek.doneCh)
 	seek.err = pc.requestSeek(seek.msgID.messageID)
 }
-
 func (pc *partitionConsumer) requestSeek(msgID messageID) error {
-	if pc.state == consumerClosing || pc.state == consumerClosed {
-		pc.log.Error("Consumer was already closed")
+	if err := pc.requestSeekWithoutClear(msgID); err != nil {
+		return err
+	}
+	pc.clearMessageChannels()
+	return nil
+}
+
+func (pc *partitionConsumer) requestSeekWithoutClear(msgID messageID) error {
+	state := pc.getConsumerState()
+	if state == consumerClosing || state == consumerClosed {
+		pc.log.WithField("state", state).Error("Consumer is closing or has closed")
 		return nil
 	}
 
@@ -447,8 +452,9 @@ func (pc *partitionConsumer) SeekByTime(time time.Time) error {
 func (pc *partitionConsumer) internalSeekByTime(seek *seekByTimeRequest) {
 	defer close(seek.doneCh)
 
-	if pc.state == consumerClosing || pc.state == consumerClosed {
-		pc.log.Error("Consumer was already closed")
+	state := pc.getConsumerState()
+	if state == consumerClosing || state == consumerClosed {
+		pc.log.WithField("state", pc.state).Error("Consumer is closing or has closed")
 		return
 	}
 
@@ -463,7 +469,15 @@ func (pc *partitionConsumer) internalSeekByTime(seek *seekByTimeRequest) {
 	if err != nil {
 		pc.log.WithError(err).Error("Failed to reset to message publish time")
 		seek.err = err
+		return
 	}
+	pc.clearMessageChannels()
+}
+
+func (pc *partitionConsumer) clearMessageChannels() {
+	doneCh := make(chan struct{})
+	pc.clearMessageQueuesCh <- doneCh
+	<-doneCh
 }
 
 func (pc *partitionConsumer) internalAck(req *ackRequest) {
@@ -542,8 +556,8 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		ackTracker = newAckTracker(numMsgs)
 	}
 
-	messagesReceived.Add(float64(numMsgs))
-	prefetchedMessages.Add(float64(numMsgs))
+	pc.metrics.MessagesReceived.Add(float64(numMsgs))
+	pc.metrics.PrefetchedMessages.Add(float64(numMsgs))
 
 	// cumulative ACKs support
 	var msgIDs []*trackingMessageID
@@ -558,8 +572,8 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 			return err
 		}
 
-		bytesReceived.Add(float64(len(payload)))
-		prefetchedBytes.Add(float64(len(payload)))
+		pc.metrics.BytesReceived.Add(float64(len(payload)))
+		pc.metrics.PrefetchedBytes.Add(float64(len(payload)))
 
 		msgID := newTrackingMessageID(
 			int64(pbMsgID.GetLedgerId()),
@@ -690,15 +704,15 @@ func (pc *partitionConsumer) dispatcher() {
 
 			if pc.dlq.shouldSendToDlq(&nextMessage) {
 				// pass the message to the DLQ router
-				dlqCounter.Inc()
+				pc.metrics.DlqCounter.Inc()
 				messageCh = pc.dlq.Chan()
 			} else {
 				// pass the message to application channel
 				messageCh = pc.messageCh
 			}
 
-			prefetchedMessages.Dec()
-			prefetchedBytes.Sub(float64(len(messages[0].payLoad)))
+			pc.metrics.PrefetchedMessages.Dec()
+			pc.metrics.PrefetchedBytes.Sub(float64(len(messages[0].payLoad)))
 		} else {
 			// we are ready for more messages
 			queueCh = pc.queueCh
@@ -772,6 +786,27 @@ func (pc *partitionConsumer) dispatcher() {
 			}
 
 			clearQueueCb(nextMessageInQueue)
+
+		case doneCh := <-pc.clearMessageQueuesCh:
+			for len(pc.queueCh) > 0 {
+				<-pc.queueCh
+			}
+			for len(pc.messageCh) > 0 {
+				<-pc.messageCh
+			}
+			messages = nil
+
+			// reset available permits
+			pc.availablePermits = 0
+			initialPermits := uint32(pc.queueSize)
+
+			pc.log.Debugf("dispatcher requesting initial permits=%d", initialPermits)
+			// send initial permits
+			if err := pc.internalFlow(initialPermits); err != nil {
+				pc.log.WithError(err).Error("unable to send initial permits to broker")
+			}
+
+			close(doneCh)
 		}
 	}
 }
@@ -860,19 +895,24 @@ func (pc *partitionConsumer) runEventsLoop() {
 
 func (pc *partitionConsumer) internalClose(req *closeRequest) {
 	defer close(req.doneCh)
-	if pc.state != consumerReady {
-		return
-	}
-
-	if pc.state == consumerClosed || pc.state == consumerClosing {
-		pc.log.Error("The consumer is closing or has been closed")
+	state := pc.getConsumerState()
+	if state != consumerReady {
+		// this might be redundant but to ensure nack tracker is closed
 		if pc.nackTracker != nil {
 			pc.nackTracker.Close()
 		}
 		return
 	}
 
-	pc.state = consumerClosing
+	if state == consumerClosed || state == consumerClosing {
+		pc.log.WithField("state", state).Error("Consumer is closing or has closed")
+		if pc.nackTracker != nil {
+			pc.nackTracker.Close()
+		}
+		return
+	}
+
+	pc.setConsumerState(consumerClosing)
 	pc.log.Infof("Closing consumer=%d", pc.consumerID)
 
 	requestID := pc.client.rpcClient.NewRequestID()
@@ -891,7 +931,7 @@ func (pc *partitionConsumer) internalClose(req *closeRequest) {
 		provider.Close()
 	}
 
-	pc.state = consumerClosed
+	pc.setConsumerState(consumerClosed)
 	pc.conn.DeleteConsumeHandler(pc.consumerID)
 	if pc.nackTracker != nil {
 		pc.nackTracker.Close()
@@ -912,7 +952,7 @@ func (pc *partitionConsumer) reconnectToBroker() {
 	}
 
 	for maxRetry != 0 {
-		if pc.state != consumerReady {
+		if pc.getConsumerState() != consumerReady {
 			// Consumer is already closing
 			return
 		}
@@ -1030,7 +1070,7 @@ func (pc *partitionConsumer) grabConn() error {
 }
 
 func (pc *partitionConsumer) clearQueueAndGetNextMessage() trackingMessageID {
-	if pc.state != consumerReady {
+	if pc.getConsumerState() != consumerReady {
 		return trackingMessageID{}
 	}
 	wg := &sync.WaitGroup{}
@@ -1052,6 +1092,10 @@ func (pc *partitionConsumer) clearQueueAndGetNextMessage() trackingMessageID {
  */
 func (pc *partitionConsumer) clearReceiverQueue() trackingMessageID {
 	nextMessageInQueue := pc.clearQueueAndGetNextMessage()
+
+	if pc.startMessageID.Undefined() {
+		return pc.startMessageID
+	}
 
 	if !nextMessageInQueue.Undefined() {
 		return getPreviousMessage(nextMessageInQueue)

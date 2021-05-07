@@ -19,25 +19,16 @@ package internal
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
 	"github.com/apache/pulsar-client-go/pulsar/log"
 
 	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 	"github.com/gogo/protobuf/proto"
-)
-
-var (
-	rpcRequestCount = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "pulsar_client_rpc_count",
-		Help: "Counter of RPC requests made by the client",
-	})
 )
 
 type RPCResult struct {
@@ -65,34 +56,67 @@ type RPCClient interface {
 }
 
 type rpcClient struct {
-	serviceURL          *url.URL
+	serviceNameResolver ServiceNameResolver
 	pool                ConnectionPool
 	requestTimeout      time.Duration
 	requestIDGenerator  uint64
 	producerIDGenerator uint64
 	consumerIDGenerator uint64
 	log                 log.Logger
+	metrics             *Metrics
 }
 
-func NewRPCClient(serviceURL *url.URL, pool ConnectionPool,
-	requestTimeout time.Duration, logger log.Logger) RPCClient {
+func NewRPCClient(serviceURL *url.URL, serviceNameResolver ServiceNameResolver, pool ConnectionPool,
+	requestTimeout time.Duration, logger log.Logger, metrics *Metrics) RPCClient {
 	return &rpcClient{
-		serviceURL:     serviceURL,
-		pool:           pool,
-		requestTimeout: requestTimeout,
-		log:            logger.SubLogger(log.Fields{"serviceURL": serviceURL}),
+		serviceNameResolver: serviceNameResolver,
+		pool:                pool,
+		requestTimeout:      requestTimeout,
+		log:                 logger.SubLogger(log.Fields{"serviceURL": serviceURL}),
+		metrics:             metrics,
 	}
 }
 
 func (c *rpcClient) RequestToAnyBroker(requestID uint64, cmdType pb.BaseCommand_Type,
 	message proto.Message) (*RPCResult, error) {
-	return c.Request(c.serviceURL, c.serviceURL, requestID, cmdType, message)
+	host, err := c.serviceNameResolver.ResolveHost()
+	if err != nil {
+		c.log.Errorf("request host resolve failed with error: {%v}", err)
+		return nil, err
+	}
+	rpcResult, err := c.Request(host, host, requestID, cmdType, message)
+	if _, ok := err.(net.Error); ok || (err != nil && err.Error() == "connection error") {
+		// We can retry this kind of requests over a connection error because they're
+		// not specific to a particular broker.
+		backoff := Backoff{100 * time.Millisecond}
+		startTime := time.Now()
+		var retryTime time.Duration
+
+		for time.Since(startTime) < c.requestTimeout {
+			retryTime = backoff.Next()
+			c.log.Debugf("Retrying request in {%v} with timeout in {%v}", retryTime, c.requestTimeout)
+			time.Sleep(retryTime)
+			host, err = c.serviceNameResolver.ResolveHost()
+			if err != nil {
+				c.log.Errorf("Retrying request host resolve failed with error: {%v}", err)
+				continue
+			}
+			rpcResult, err = c.Request(host, host, requestID, cmdType, message)
+			if _, ok := err.(net.Error); ok || (err != nil && err.Error() == "connection error") {
+				continue
+			} else {
+				// We either succeeded or encountered a non connection error
+				break
+			}
+		}
+	}
+	return rpcResult, err
 }
 
 func (c *rpcClient) Request(logicalAddr *url.URL, physicalAddr *url.URL, requestID uint64,
 	cmdType pb.BaseCommand_Type, message proto.Message) (*RPCResult, error) {
-	rpcRequestCount.Inc()
-	cnx, err := c.getConn(logicalAddr, physicalAddr)
+	c.metrics.RPCRequestCount.Inc()
+	cnx, err := c.pool.GetConnection(logicalAddr, physicalAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -119,30 +143,9 @@ func (c *rpcClient) Request(logicalAddr *url.URL, physicalAddr *url.URL, request
 	}
 }
 
-func (c *rpcClient) getConn(logicalAddr *url.URL, physicalAddr *url.URL) (Connection, error) {
-	cnx, err := c.pool.GetConnection(logicalAddr, physicalAddr)
-	backoff := Backoff{1 * time.Second}
-	startTime := time.Now()
-	var retryTime time.Duration
-	if err != nil {
-		for time.Since(startTime) < c.requestTimeout {
-			retryTime = backoff.Next()
-			c.log.Debugf("Reconnecting to broker in {%v} with timeout in {%v}", retryTime, c.requestTimeout)
-			time.Sleep(retryTime)
-			cnx, err = c.pool.GetConnection(logicalAddr, physicalAddr)
-			if err == nil {
-				c.log.Debugf("retry connection success")
-				return cnx, nil
-			}
-		}
-		return nil, err
-	}
-	return cnx, nil
-}
-
 func (c *rpcClient) RequestOnCnx(cnx Connection, requestID uint64, cmdType pb.BaseCommand_Type,
 	message proto.Message) (*RPCResult, error) {
-	rpcRequestCount.Inc()
+	c.metrics.RPCRequestCount.Inc()
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
@@ -162,7 +165,7 @@ func (c *rpcClient) RequestOnCnx(cnx Connection, requestID uint64, cmdType pb.Ba
 }
 
 func (c *rpcClient) RequestOnCnxNoWait(cnx Connection, cmdType pb.BaseCommand_Type, message proto.Message) error {
-	rpcRequestCount.Inc()
+	c.metrics.RPCRequestCount.Inc()
 	return cnx.SendRequestNoWait(baseCommand(cmdType, message))
 }
 
