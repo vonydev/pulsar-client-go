@@ -318,8 +318,8 @@ func (pc *partitionConsumer) AckCumulativeID(msgID trackingMessageID) {
 			return
 		}
 
-		acksCounter.Inc()
-		processingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
+		pc.metrics.AcksCounter.Inc()
+		pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
 		req := &ackCumulativeRequest{
 			msgID: *ackMsgID,
 		}
